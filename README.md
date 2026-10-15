@@ -2,7 +2,27 @@
 
 A support portal for BookLeaf Publishing with two sides: an **author portal** where authors view their books and royalties and raise support tickets, and an **admin portal** where the operations team triages and answers them, helped by AI classification and AI-drafted replies grounded in BookLeaf's knowledge base.
 
-> **Status:** backend complete: data model, seed, authentication, role-based access, the REST API, and the AI layer (classification, drafted replies, fallbacks, cost tracking, evaluation). Real-time updates and the web UI are in progress.
+**Live demo:** _add your deployed URL here_ · **Write-up:** [docs/WRITEUP.md](docs/WRITEUP.md) · **AI eval results:** [server/eval/RESULTS.md](server/eval/RESULTS.md)
+
+## What it does
+
+**For authors**
+- **My books:** every book with its status, ISBN, MRP, sales and royalties. Books in production show their stage (e.g. "Typesetting, stage 4 of 9") instead of ₹0 figures.
+- **Royalty summary:** a plain-language explanation of where the money is, for example "₹850 is below the ₹1,000 minimum payout, so it rolls over", or the date of the next payout.
+- **Raise a ticket:** pick a book (or "General / account level"), add a subject and details, and optionally attach a file. Opening the form from a book's "Ask about this book" link pre-selects that book.
+- **My tickets:** status with a plain-English meaning, the full conversation, and replies. **Replies from BookLeaf appear live**, with a notification, without refreshing. Replying to a resolved ticket reopens it.
+
+**For the BookLeaf team**
+- **Ticket queue**
+  - Opens on unresolved tickets, sorted most urgent first, then longest waiting. Every ticket shows how long it has waited, and tickets past their first-response target are flagged red.
+  - Saved views: unresolved, assigned to me, unassigned, resolved. Filters by category, priority and date. All filters live in the URL, so a view can be refreshed or shared.
+  - New tickets and changes appear live.
+- **Ticket workspace**
+  - The request and conversation, with an **AI-drafted reply already in the reply box**, plus the AI's notes for the agent and the team to escalate to.
+  - "Send" and "Send & mark resolved" buttons; sending is blocked while `[CONFIRM: …]` placeholders remain.
+  - Triage controls: status, category and priority (each tagged AI, Rules or Admin), the AI's reasoning, "Re-run AI triage" and "Assign to me".
+  - The author's royalty account and the book's details on the same screen, and internal notes the author never sees.
+- **AI insights:** AI status, spend and latency, how often admins corrected the AI, and how often drafts were sent as written.
 
 ## Quick start
 
@@ -13,10 +33,12 @@ npm install
 cp server/.env.example server/.env      # then set DATABASE_URL, TEST_DATABASE_URL, JWT_SECRET and GEMINI_API_KEY
 createdb bookleaf && createdb bookleaf_test
 npm run db:migrate                       # applies migrations and seeds the sample data
-npm run dev                              # API on http://localhost:4000
-npm test                                 # 93 tests: unit + API integration (uses TEST_DATABASE_URL, no API calls)
-npm run eval -w server                   # AI evaluation against labelled scenarios (see "Measuring quality")
+npm run dev                              # web app on http://localhost:5173 (API on :4000, proxied)
+npm test                                 # 99 tests: unit + API + real-time integration (no AI calls, no cost)
+npm run eval                             # AI evaluation against labelled scenarios (see "Measuring quality")
 ```
+
+Production build: `npm run build && npm start` serves the API and the built web app together on `PORT` (default 4000).
 
 Re-seed at any time with `npm run db:seed`. Authors, books and admins are upserted, and demo tickets are reset.
 
@@ -49,6 +71,27 @@ The sample dataset is imported as-is (ids such as `AUTH001` and `BK001` are kept
 - **The ₹1,000 minimum applies to an author's combined balance**, since payouts go to one bank account.
 - **"Needs review" rather than "overdue".** The dataset has no per-quarter accrual history, so the system can only tell that a payout covering the last closed cycle is missing. It flags those for an admin to verify instead of asserting the payment is late.
 - **Books in production already have ISBNs** in the dataset, even though ISBN assignment is a later stage, so the API marks those ISBNs as `RESERVED`.
+
+## Architecture
+
+```
+Browser (React)  ──HTTPS──►  Express server (one service)  ──►  PostgreSQL (Prisma)
+  │  REST /api/v1  ◄──────────┤  • REST API + auth + role checks
+  │  SSE  /api/v1/events ◄────┤  • serves the built React app
+  │                           │  • background classification queue
+  │                           └──►  Gemini API (server-side only, via one AI gateway)
+```
+
+| Decision | Why |
+|---|---|
+| **One deployable**: Express serves the API and the built React app | One URL to test. Same origin means no CORS, and the httpOnly session cookie and event stream work without cross-site configuration |
+| **TypeScript everywhere**: Express 5, Prisma, Zod; React 19 + Vite, TanStack Query, Tailwind | One language end to end. Zod validates every input and the AI's output. Prisma gives typed queries and versioned migrations |
+| **PostgreSQL** | The data is relational (authors → books → tickets → messages), and enums let the database sort priorities correctly (`ORDER BY priority` puts Critical first) |
+| **Layered modules:** `routes → service → dto`, plus a `domain/` folder of pure business rules | HTTP concerns, logic and response shapes stay separate. The author and admin views of a ticket are different DTOs built from different queries |
+| **Row-level access in one place** ([access.ts](server/src/lib/access.ts)) | Every author-owned query is scoped by the same rule; another author's records return 404 |
+| **Classification in a background queue** | Creating a ticket never waits on, or fails because of, the AI. State lives in the database, so a restart loses nothing |
+| **Server-Sent Events for real-time** ([hub.ts](server/src/realtime/hub.ts)) | Updates only flow server → browser, which is what SSE is for: simpler than WebSockets, with automatic reconnection. Events carry only "ticket X changed"; the browser refetches through the normal API, so access control stays in one place and the stream never carries ticket content |
+| **TanStack Query on the client** | Server state is cached and refetched by key. A real-time event just invalidates the affected keys, so there's no hand-written client state syncing |
 
 ## AI integration
 
@@ -183,6 +226,7 @@ All endpoints are under `/api/v1`, use JSON, and authenticate with an httpOnly s
 | `POST /tickets/:ticketId/draft` | admin | Regenerate the draft even if nothing changed |
 | `POST /tickets/:ticketId/classification` | admin | Re-run classification now; admin overrides are kept |
 | `GET /ai/metrics` | admin | AI status (enabled, circuit breaker), usage and cost per operation, correction rate, draft usage |
+| `GET /events` | signed in | Server-Sent Events stream of `{ ticketId, reason }` for tickets the user may see. Authors get replies and status changes on their own tickets; internal changes (triage, notes) go to admins only |
 
 Access rules worth knowing:
 - Another author's records return **404, not 403**, so ids cannot be probed.
@@ -193,6 +237,12 @@ Access rules worth knowing:
 
 ```
 data/                      Sample dataset provided by BookLeaf
+client/                    React web app (both portals)
+  src/api/                 Typed API client and React Query hooks
+  src/realtime/            Event-stream hook: invalidates queries when tickets change
+  src/pages/author/        My books, raise a ticket, my tickets
+  src/pages/admin/         Queue, ticket workspace (with AI draft composer), AI insights
+  src/components/          Layout, role guard, shared UI
 server/
   prisma/                  Schema, migrations, seed script, demo tickets
   src/
@@ -207,6 +257,7 @@ server/
       drafter.ts             Drafts with prompt-hash caching and stale fallback
       rules.ts               Keyword fallback and policy floors
     jobs/                  Background classification queue and retry sweep
+    realtime/              Server-Sent Events hub and route
     lib/                   Shared infrastructure: errors, validation, sessions, access scope
     middleware/            Authentication, role checks, rate limits, error handler
     modules/<feature>/     routes (HTTP) → service (logic + data access) → dto (response shape)
@@ -214,8 +265,41 @@ server/
   eval/                    Labelled AI scenarios and the evaluation runner
 ```
 
+## Deployment
+
+The app deploys as **one Node service plus a PostgreSQL database**. On every start it applies migrations and seeds the BookLeaf dataset **only if the database is empty**, so the first deploy is pre-seeded and restarts never wipe tickets.
+
+**Render** (blueprint included):
+1. Push this repository to GitHub, then in Render choose **New → Blueprint** and select the repository. [render.yaml](render.yaml) creates the web service and the database.
+2. When prompted, set `GEMINI_API_KEY`. `JWT_SECRET` is generated automatically.
+3. The free plan sleeps when idle, so the first request then takes about a minute. For a demo other people will open, use a paid instance type.
+
+**Any other Node host** (Railway, Fly.io, a VPS):
+
+| Setting | Value |
+|---|---|
+| Build | `npm ci --include=dev && npm run build` |
+| Start | `npm run start:production` |
+| Health check | `/api/health` |
+| Required env | `DATABASE_URL`, `JWT_SECRET` (32+ characters), `NODE_ENV=production` |
+| Optional env | `GEMINI_API_KEY`, `AI_CLASSIFY_MODEL`, `AI_DRAFT_MODEL`, `DATA_AS_OF_DATE` |
+
+Use a **paid Gemini key** for a public demo: the free tier allows 15 requests per minute per model (see Security notes).
+
+## Known limitations and what I'd do next
+
+- **Attachments are UI only**, as the brief allowed: the file's name, size and type are validated and recorded, but the file isn't stored. Next step: object storage (S3/GCS) with signed upload URLs and virus scanning.
+- **Single-instance design.** The classification queue and the real-time hub live in process memory. Both recover from restarts, but running several servers would need a shared queue (e.g. BullMQ on Redis) and fan-out via Redis pub/sub or Postgres `LISTEN/NOTIFY`.
+- **Royalty data is a snapshot** with no per-quarter history, so "missed payout" can only be flagged for review, not proven. With a payouts table this becomes exact.
+- **No email notifications.** Authors see replies live in the portal; production would also email them.
+- **Deflection before a ticket is raised:** the knowledge base could suggest an answer while the author is still typing, which would reduce ticket volume. This is the next AI feature I'd build.
+- **AI quality loop:** admin corrections and edited drafts are measured but not yet fed back. Next step: add corrected tickets to the eval set and to the prompt's examples.
+- **Client types are hand-written** to match the server's DTOs. Next step: generate an OpenAPI spec from the Zod schemas, and the client types from that.
+- **First-response targets** (Critical 4h, High 24h, Medium 48h, Low 72h) are my assumption; BookLeaf's brief doesn't define SLAs.
+
 ## Security notes
 
 - `GEMINI_API_KEY` is read from the server environment only ([client.ts](server/src/ai/client.ts)). The browser never calls the model and never receives the key. `.env` files are git-ignored; only `.env.example` is committed.
 - **Free tier vs paid tier:** on Gemini's free tier, Google may use prompts to improve its products, and these prompts contain author names and royalty figures. The free tier also allows only 15 requests per minute per model. Development used the free tier; real author data and a public demo belong on the paid tier, where prompts are not used that way.
 - Sessions are httpOnly, SameSite=Lax cookies; passwords are hashed with bcrypt; login is rate limited and gives the same error for unknown emails and wrong passwords.
+- The login page lists the demo accounts so evaluators can sign in quickly. A real deployment would remove that panel.
