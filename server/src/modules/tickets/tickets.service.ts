@@ -2,6 +2,7 @@ import { ClassificationSource, TicketStatus, type Prisma } from '@prisma/client'
 import { findPlaceholders } from '../../ai/prompts/draft.js';
 import { enqueueClassification } from '../../jobs/classificationWorker.js';
 import { prisma } from '../../lib/prisma.js';
+import { realtimeHub } from '../../realtime/hub.js';
 import { requireAuthorId } from '../../lib/access.js';
 import { addDays, parseIsoDate } from '../../lib/dates.js';
 import { ConflictError, NotFoundError, ValidationError } from '../../lib/errors.js';
@@ -52,6 +53,7 @@ export async function createTicket(user: SessionUser, input: CreateTicketInput) 
 
   // The ticket is saved before any AI work starts, so an AI outage can never stop an author raising a ticket.
   enqueueClassification(ticket.id);
+  realtimeHub.publish({ ticketId: ticket.id, authorId, reason: 'created' }, 'author-and-admins');
   return dto.toAuthorTicketDto(ticket);
 }
 
@@ -73,8 +75,9 @@ export async function listAuthorTickets(user: SessionUser, query: AuthorTicketLi
 }
 
 export async function addAuthorMessage(user: SessionUser, ticketId: string, input: AuthorMessageInput) {
+  const authorId = requireAuthorId(user);
   const ticket = await prisma.ticket.findFirst({
-    where: { id: ticketId, authorId: requireAuthorId(user) },
+    where: { id: ticketId, authorId },
     select: { status: true },
   });
   if (!ticket) throw new NotFoundError('Ticket');
@@ -94,6 +97,7 @@ export async function addAuthorMessage(user: SessionUser, ticketId: string, inpu
       data: reopen ? { status: TicketStatus.OPEN, resolvedAt: null } : { updatedAt: new Date() },
     }),
   ]);
+  realtimeHub.publish({ ticketId, authorId, reason: 'author_message' }, 'author-and-admins');
   return dto.toMessageDto(message);
 }
 
@@ -156,13 +160,18 @@ export async function updateTicket(ticketId: string, input: UpdateTicketInput) {
   };
 
   const updated = await prisma.ticket.update({ where: { id: ticketId }, data, include: dto.adminTicketInclude });
+  // Authors see status changes; category, priority and assignment are internal.
+  realtimeHub.publish(
+    { ticketId, authorId: updated.authorId, reason: input.status ? 'status' : 'triage' },
+    input.status ? 'author-and-admins' : 'admins',
+  );
   return dto.toAdminTicketDto(updated);
 }
 
 export async function addAdminMessage(admin: SessionUser, ticketId: string, input: AdminMessageInput) {
   const ticket = await prisma.ticket.findUnique({
     where: { id: ticketId },
-    select: { status: true, resolvedAt: true, assigneeId: true, firstResponseAt: true },
+    select: { authorId: true, status: true, resolvedAt: true, assigneeId: true, firstResponseAt: true },
   });
   if (!ticket) throw new NotFoundError('Ticket');
 
@@ -202,6 +211,7 @@ export async function addAdminMessage(admin: SessionUser, ticketId: string, inpu
       },
     }),
   ]);
+  realtimeHub.publish({ ticketId, authorId: ticket.authorId, reason: 'reply' }, 'author-and-admins');
   return dto.toMessageDto(message);
 }
 
@@ -216,12 +226,13 @@ export async function listNotes(ticketId: string) {
 }
 
 export async function addNote(admin: SessionUser, ticketId: string, input: NoteInput) {
-  await assertTicketExists(ticketId);
+  const { authorId } = await findTicketOwner(ticketId);
   // Deliberately does not touch the ticket, so internal activity never shows up on the author's side.
   const note = await prisma.internalNote.create({
     data: { ticketId, adminId: admin.id, body: input.body },
     include: dto.noteInclude,
   });
+  realtimeHub.publish({ ticketId, authorId, reason: 'note' }, 'admins');
   return dto.toNoteDto(note);
 }
 
@@ -258,6 +269,12 @@ function createdAtRange(from?: string, to?: string): Prisma.TicketWhereInput {
 async function assertTicketExists(ticketId: string) {
   const exists = await prisma.ticket.count({ where: { id: ticketId } });
   if (!exists) throw new NotFoundError('Ticket');
+}
+
+async function findTicketOwner(ticketId: string) {
+  const ticket = await prisma.ticket.findUnique({ where: { id: ticketId }, select: { authorId: true } });
+  if (!ticket) throw new NotFoundError('Ticket');
+  return ticket;
 }
 
 async function assertAdminUser(userId: string) {

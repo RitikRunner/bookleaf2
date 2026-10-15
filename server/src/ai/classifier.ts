@@ -1,6 +1,7 @@
 import { AiStatus, ClassificationSource, type AiConfidence, type Prisma } from '@prisma/client';
 import { env } from '../config/env.js';
 import { prisma } from '../lib/prisma.js';
+import { realtimeHub } from '../realtime/hub.js';
 import { AiUnavailableError, type AiFailureReason } from './errors.js';
 import { generateStructured, type StructuredRequest } from './gateway.js';
 import { buildClassificationPrompt, CLASSIFICATION_PROMPT_VERSION, classificationSchema } from './prompts/classification.js';
@@ -66,6 +67,7 @@ export async function classifyTicket(ticketId: string): Promise<void> {
       data: { priority: final.priority, prioritySource: source },
     }),
   ]);
+  realtimeHub.publish({ ticketId, authorId: ticket.authorId, reason: 'triage' }, 'admins');
 }
 
 /** The exact request production sends. The offline eval reuses it, so it measures what actually runs. */

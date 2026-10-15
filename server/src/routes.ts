@@ -5,6 +5,7 @@ import { authRouter } from './modules/auth/auth.routes.js';
 import { authorsRouter } from './modules/authors/authors.routes.js';
 import { booksRouter } from './modules/books/books.routes.js';
 import { ticketsRouter } from './modules/tickets/tickets.routes.js';
+import { eventsRouter } from './realtime/events.routes.js';
 
 export const apiRouter = Router();
 
@@ -17,3 +18,4 @@ apiRouter.use('/authors', authorsRouter);
 apiRouter.use('/books', booksRouter);
 apiRouter.use('/tickets', ticketsRouter);
 apiRouter.use('/ai', aiRouter);
+apiRouter.use('/events', eventsRouter);
