@@ -37,3 +37,4 @@ jobs:
       - run: npx -w server prisma generate
       - run: npm run typecheck
       - run: npm test
+      - run: npm run build

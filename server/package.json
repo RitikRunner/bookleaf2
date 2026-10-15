@@ -13,7 +13,8 @@
     "db:deploy": "prisma migrate deploy",
     "db:seed": "prisma db seed",
     "db:reset": "prisma migrate reset --force",
-    "eval": "tsx eval/run.ts"
+    "eval": "tsx eval/run.ts",
+    "db:setup": "prisma migrate deploy && tsx prisma/seed.ts --if-empty"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

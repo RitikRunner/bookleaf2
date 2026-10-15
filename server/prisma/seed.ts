@@ -4,6 +4,7 @@
  * - Validates the file's shape and its royalty arithmetic before writing anything.
  * - Idempotent for reference data (users, authors, books are upserted).
  * - Resets demo tickets on every run, so re-seeding gives a clean demo.
+ * - With --if-empty it does nothing when the database already has users (used on deployment start-up).
  */
 import { readFile } from 'node:fs/promises';
 import bcrypt from 'bcryptjs';
@@ -196,6 +197,11 @@ async function seedDemoTickets(userIdByAuthorId: Map<string, string>, adminIds: 
 }
 
 async function main() {
+  // Deployments run the seed on every start with --if-empty, so a restart never wipes tickets created since.
+  if (process.argv.includes('--if-empty') && (await prisma.user.count()) > 0) {
+    console.log('Database already seeded; skipping.');
+    return;
+  }
   const userIdByAuthorId = await seedAuthorsAndBooks();
   const adminIds = await seedAdmins();
   await seedDemoTickets(userIdByAuthorId, adminIds);
