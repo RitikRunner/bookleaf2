@@ -1,0 +1,279 @@
+// BookLeaf Author Support Portal: data model.
+// Money is stored as whole rupees (Int) because every amount in the BookLeaf dataset is a whole INR value.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  AUTHOR
+  ADMIN
+}
+
+/// Production pipeline from the knowledge base, in order. A book is live once it reaches PUBLISHED_LIVE.
+enum ProductionStage {
+  MANUSCRIPT_RECEIVED
+  EDITING
+  COVER_DESIGN
+  TYPESETTING
+  PROOFREADING
+  ISBN_ASSIGNMENT
+  PRINTING
+  DISTRIBUTION_SETUP
+  PUBLISHED_LIVE
+}
+
+enum PrintPartner {
+  IN_HOUSE
+  REPRO_INDIA
+  EPITOME_BOOKS
+}
+
+enum Platform {
+  AMAZON_IN
+  FLIPKART
+  AMAZON_US
+  AMAZON_UK
+  BOOKLEAF_STORE
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum TicketCategory {
+  ROYALTY_PAYMENTS
+  ISBN_METADATA
+  PRINTING_QUALITY
+  DISTRIBUTION_AVAILABILITY
+  BOOK_STATUS_PRODUCTION
+  GENERAL_INQUIRY
+}
+
+/// Declared most-urgent first: Postgres sorts enums in declaration order, so ORDER BY priority ASC puts Critical on top.
+enum TicketPriority {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// Who set a ticket's current category/priority.
+enum ClassificationSource {
+  AI
+  RULES
+  ADMIN
+}
+
+enum AiStatus {
+  PENDING   // waiting to be classified
+  COMPLETED // classified by the AI model
+  FALLBACK  // AI unavailable: classified by keyword rules, retried later
+}
+
+/// The model's self-reported confidence. Categorical on purpose: an LLM's numeric confidence would look more precise than it is.
+enum AiConfidence {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum AiOperation {
+  CLASSIFY
+  DRAFT
+}
+
+/// Internal team a drafted reply says must act on the ticket.
+enum EscalationTeam {
+  NONE
+  FINANCE
+  PRODUCTION
+  DISTRIBUTION
+  PRINTING
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role
+  createdAt    DateTime @default(now())
+
+  author          Author?
+  assignedTickets Ticket[]        @relation("TicketAssignee")
+  messages        TicketMessage[]
+  internalNotes   InternalNote[]
+}
+
+/// Author profile. Ids are kept from the BookLeaf dataset (e.g. AUTH001).
+model Author {
+  id         String   @id
+  userId     String   @unique
+  phone      String?
+  city       String?
+  joinedDate DateTime @db.Date
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  books   Book[]
+  tickets Ticket[]
+}
+
+/// A book and its royalty snapshot. Ids are kept from the BookLeaf dataset (e.g. BK001).
+model Book {
+  id              String          @id
+  authorId        String
+  title           String
+  isbn            String?         @unique
+  genre           String
+  publicationDate DateTime?       @db.Date
+  stage           ProductionStage
+  mrp             Int?
+  royaltyPerCopy  Int?
+  copiesSold      Int             @default(0)
+  royaltyEarned   Int             @default(0)
+  royaltyPaid     Int             @default(0)
+  royaltyPending  Int             @default(0)
+  lastPayoutDate  DateTime?       @db.Date
+  printPartner    PrintPartner?
+  availableOn     Platform[]
+
+  author  Author   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  tickets Ticket[]
+
+  @@index([authorId])
+}
+
+model Ticket {
+  id          String       @id @default(cuid())
+  number      Int          @unique @default(autoincrement())
+  authorId    String
+  bookId      String? // null = "General / Account level"
+  subject     String
+  description String
+  status      TicketStatus @default(OPEN)
+
+  // Current values used by the queue: AI suggestion, rules fallback, or admin override.
+  category       TicketCategory?
+  categorySource ClassificationSource?
+  priority       TicketPriority?
+  prioritySource ClassificationSource?
+
+  // The AI's original output is kept after an admin override, so classification accuracy can be measured.
+  aiStatus     AiStatus        @default(PENDING)
+  aiCategory   TicketCategory?
+  aiPriority   TicketPriority?
+  aiConfidence AiConfidence?
+  aiReasoning  String?
+  aiAttempts   Int             @default(0)
+  aiLastError  String?
+
+  assigneeId String?
+
+  // Attachment metadata only. File storage is out of scope (see README).
+  attachmentName String?
+  attachmentSize Int?
+  attachmentType String?
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  firstResponseAt DateTime?
+  resolvedAt      DateTime?
+
+  author   Author          @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  book     Book?           @relation(fields: [bookId], references: [id], onDelete: SetNull)
+  assignee User?           @relation("TicketAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  messages TicketMessage[]
+  notes    InternalNote[]
+  drafts   AiDraft[]
+  aiUsage  AiUsageLog[]
+
+  @@index([status, priority, createdAt])
+  @@index([authorId, createdAt])
+  @@index([assigneeId])
+  @@index([aiStatus])
+}
+
+/// The conversation the author sees: their messages and admin replies.
+model TicketMessage {
+  id        String   @id @default(cuid())
+  ticketId  String
+  senderId  String
+  body      String
+  createdAt DateTime @default(now())
+
+  // Set when an admin reply started from an AI draft, so draft usefulness can be measured.
+  aiDraftId   String?
+  draftEdited Boolean?
+
+  ticket  Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  sender  User     @relation(fields: [senderId], references: [id])
+  aiDraft AiDraft? @relation(fields: [aiDraftId], references: [id], onDelete: SetNull)
+
+  @@index([ticketId, createdAt])
+}
+
+/// Admin-only notes. Kept in their own table (not a flag on TicketMessage) so an author-facing query can never leak them.
+model InternalNote {
+  id        String   @id @default(cuid())
+  ticketId  String
+  adminId   String
+  body      String
+  createdAt DateTime @default(now())
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  admin  User   @relation(fields: [adminId], references: [id])
+
+  @@index([ticketId, createdAt])
+}
+
+/// An AI-drafted reply. Cached by a hash of the exact prompt, so it is only regenerated when its inputs change
+/// (a new message, a category override, a new internal note) or an admin asks for a fresh one.
+model AiDraft {
+  id              String         @id @default(cuid())
+  ticketId        String
+  contextHash     String
+  reply           String
+  adminNotes      String[]
+  suggestedStatus TicketStatus
+  escalateTo      EscalationTeam
+  model           String
+  promptVersion   String
+  createdAt       DateTime       @default(now())
+
+  ticket   Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  messages TicketMessage[]
+
+  @@index([ticketId, contextHash])
+}
+
+/// One row per model call, successful or not. The basis for cost, latency and reliability reporting.
+model AiUsageLog {
+  id               String      @id @default(cuid())
+  operation        AiOperation
+  model            String
+  promptVersion    String
+  ticketId         String?
+  success          Boolean
+  errorType        String?
+  inputTokens      Int         @default(0)
+  outputTokens     Int         @default(0)
+  cacheReadTokens  Int         @default(0)
+  /// Estimated cost in millionths of a US dollar (integer, so sums are exact).
+  costMicroUsd     Int         @default(0)
+  latencyMs        Int
+  createdAt        DateTime    @default(now())
+
+  ticket Ticket? @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@index([operation, createdAt])
+  @@index([ticketId])
+}
