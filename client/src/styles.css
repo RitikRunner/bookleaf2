@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@theme {
+  /* BookLeaf blue, taken from the brief's header colour. */
+  --color-brand-50: #eef5f9;
+  --color-brand-100: #d6e7f1;
+  --color-brand-200: #aecfe2;
+  --color-brand-500: #2c6f96;
+  --color-brand-600: #1b5476;
+  --color-brand-700: #154462;
+  --color-brand-800: #10354d;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+body {
+  @apply bg-slate-50 text-slate-800 antialiased;
+}

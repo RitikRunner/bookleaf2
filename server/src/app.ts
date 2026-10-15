@@ -1,3 +1,6 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
@@ -32,7 +35,24 @@ export function createApp() {
 
   app.use('/api/v1', apiRouter);
   app.use('/api', notFoundHandler);
+  serveWebApp(app);
   app.use(errorHandler);
 
   return app;
+}
+
+const CLIENT_DIST = fileURLToPath(new URL('../../client/dist', import.meta.url));
+
+/**
+ * In production the API also serves the built React app, so the portal runs on a single origin: no CORS, and the
+ * session cookie and event stream work without cross-site settings. In development Vite serves the app instead.
+ */
+function serveWebApp(app: express.Express) {
+  if (!existsSync(CLIENT_DIST)) return;
+  // Bundled assets have content hashes in their names, so they can be cached for a long time.
+  app.use('/assets', express.static(join(CLIENT_DIST, 'assets'), { immutable: true, maxAge: '1y' }));
+  app.use(express.static(CLIENT_DIST, { index: false }));
+  // Any other path is a client-side route (e.g. /admin/tickets/abc), so it gets the app shell.
+  // API paths and missing asset files fall through to a real 404 instead.
+  app.get(/^\/(?!api\/|assets\/).*/, (_req, res) => res.sendFile(join(CLIENT_DIST, 'index.html')));
 }
